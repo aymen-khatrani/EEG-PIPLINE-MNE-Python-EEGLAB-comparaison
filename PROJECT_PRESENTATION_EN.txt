@@ -1,0 +1,324 @@
+================================================================================
+REPRODUCING THE EEG-fMRI PIPELINE IN PYTHON
+Project overview (up to date)
+================================================================================
+
+Author: Aymen Khatrani
+Laboratory: MIMLAB, Bogazici University (Istanbul)
+Lab supervisor: Prof. Pinar S. Ozbay
+School tutor (ISIA): Ms Clarisse Dhaenens
+
+This document accompanies the slide presentation (HTML, PowerPoint and LaTeX/PDF
+files). It explains the goal of the project, its context, each of its parts, the
+results and the perspectives. It is written in plain text, with no accents or
+special characters. It reflects the most complete version of the notebook,
+including the bonus method-comparison sections and the full EEGLAB-vs-Python
+comparison framework.
+
+
+================================================================================
+1. ONE-SENTENCE SUMMARY
+================================================================================
+
+The project reproduces in Python (MNE library) a preprocessing pipeline for EEG
+signals recorded simultaneously with functional MRI (EEG-fMRI), a pipeline
+originally built in EEGLAB (MATLAB); it adds a machine-learning component to
+classify the ICA components, a set of machine-learning-inspired alternatives to
+the classical artifact-correction steps, and a quantitative comparison between the
+two implementations.
+
+
+================================================================================
+2. CONTEXT AND PROBLEM STATEMENT
+================================================================================
+
+Simultaneous EEG-fMRI combines two complementary modalities:
+  - EEG (electroencephalography), very precise in TIME (milliseconds);
+  - functional MRI (fMRI), very precise in SPACE (millimeters).
+
+Recording EEG inside the MRI scanner raises a major problem: the EEG signal is
+massively contaminated by two artifacts:
+  - the gradient artifact, caused by the fast switching of the MRI gradients; its
+    amplitude is on the order of a millivolt, i.e. about 1000 times the useful EEG,
+    which is on the order of a microvolt;
+  - the ballistocardiogram (BCG) or pulse artifact, caused by the movement of the
+    electrodes induced by the heartbeat inside the magnetic field.
+
+Historically, cleaning these artifacts is done in EEGLAB (MATLAB) with the FMRIB
+plugin (FASTR algorithm for the gradient and OBS for the BCG).
+
+Limitations of this approach: MATLAB is proprietary and paid software, and the
+manual pipeline is poorly reproducible and hard to automate.
+
+Hence the problem statement: can we faithfully reproduce this pipeline in Python
+(free, open, reproducible), validate it quantitatively against EEGLAB, and add a
+modern machine-learning component?
+
+
+================================================================================
+3. GOALS AND OBJECTIVES
+================================================================================
+
+Scientific and technical objectives:
+  O1. Reproduce from scratch, in Python/MNE, each step of the EEGLAB pipeline,
+      including the FASTR (gradient) and OBS (BCG) algorithms which do not exist
+      natively in MNE.
+  O2. Build a machine-learning dataset describing the ICA components (feature
+      extraction) and label it.
+  O3. Select and optimize a machine-learning model to classify the components
+      (artifact vs neural), and compare it to ICLabel, the domain reference tool.
+  O4. Quantitatively compare the EEGLAB and Python outputs (spectrum, wavelets, ICA
+      topographies, statistics) to prove the equivalence of the pipelines.
+
+Bonus objective: test whether machine-learning-inspired alternatives (PCA/Ridge
+regression, non-linear MLP autoencoder) improve the classical artifact-correction
+steps (AAS for the gradient, OBS for the BCG).
+
+ISIA competency objectives validated by the project:
+  - Objective 1: mobilize advanced scientific and technical knowledge (signal
+    processing, multivariate statistics, non-parametric tests).
+  - Objective 2: define and build machine-learning datasets.
+  - Objective 3: select a model and optimize its parameters.
+
+
+================================================================================
+4. DATA USED
+================================================================================
+
+  - Subject: sub-38 (real laboratory data).
+  - EEG: 32 channels, including 31 EEG electrodes in the 10-20 system and 1 ECG
+    channel.
+  - Sampling rate: 5000 Hz.
+  - Recording: inside the MRI scanner, resting-state task (rest).
+  - Duration: about 392 seconds per recording.
+  - Number of recordings: 2 (run-01 and run-02).
+  - The notebook also runs on a simulated dataset, which makes it executable without
+    real data (useful for demonstration and testing).
+
+
+================================================================================
+5. THE PARTS OF THE PROJECT
+================================================================================
+
+The project is organized into five phases.
+
+--------------------------------------------------------------------------------
+PHASE 0 - Configuration and loading
+--------------------------------------------------------------------------------
+Centralization of all parameters in a single configuration cell (including the
+parameters of the machine-learning comparison methods), and loading of the
+BrainVision data (or generation of a simulated dataset). The ECG channel is marked
+as such so as not to pollute the EEG processing.
+
+--------------------------------------------------------------------------------
+PHASE 1 - Preprocessing (the core of the project)
+--------------------------------------------------------------------------------
+Faithful chaining of the EEGLAB steps:
+  1.2  Automatic detection of the fMRI volume trigger from the signal alone
+       (data-driven approach based on the periodicity of the markers).
+  1.3  Gradient-artifact correction by AAS (Average Artifact Subtraction), the
+       in-house equivalent of FASTR.
+  1.3bis  BONUS - method comparison for the gradient (see section 6).
+  1.4  50 Hz notch filter (mains power).
+  1.5  QRS complex detection on the ECG (heartbeat landmarks).
+  1.6  BCG correction by OBS (Optimal Basis Set), the in-house equivalent of
+       FASTR/OBS.
+  1.6bis  BONUS - method comparison for the BCG (see section 6).
+  1.7  Resampling to 250 Hz.
+  1.8  Common average reference (ECG excluded).
+  1.9  Band-pass filter 1-40 Hz.
+  1.10 ICA by extended Infomax (equivalent of runica in EEGLAB).
+  1.11 Automatic component classification by ICLabel.
+  1.12 Removal of artifact components and reconstruction of the clean signal.
+  1.13 Batch processing of the other recordings with exactly the same steps.
+
+Concrete results obtained on sub-38:
+  - Volume trigger detected: R128, TR of about 3 seconds, 120 volumes.
+  - 767 heartbeats detected.
+  - 30 ICA components (one fewer than 31 channels, because of the average reference).
+  - 5 of the 30 components identified as artifacts (blinks, muscle, etc.).
+
+--------------------------------------------------------------------------------
+PHASE 2 - EEGLAB vs Python comparison
+--------------------------------------------------------------------------------
+We do not assume the equivalence of the two pipelines, we measure it. The notebook
+provides two levels:
+  - Per-axis checks (2.1 to 2.4): power spectrum (Welch), time-frequency (Morlet
+    wavelets), structural ICA-topography matching (by spatial correlation, since
+    ICA is not deterministic), and inferential statistics (Wilcoxon, permutation,
+    FDR correction).
+  - A full quantitative comparison (2.5) driven by an EEGLAB export, organized in
+    four sub-sections:
+      2.5.0  load the EEGLAB export (.set + .mat) and shared helpers;
+      2.5.1  stage-by-stage PSD (import, gradient, notch, BCG, filter, clean) -
+             a per-stage correlation above 0.8 shows the two implementations act
+             the same way at each step;
+      2.5.2  final-signal equivalence (per-channel PSD correlation, per-band
+             differences, spatial topography, occipital alpha peak);
+      2.5.3  ICA + ICLabel agreement (optimal Hungarian matching of the two
+             component sets, Cohen kappa on the labels);
+      2.5.4  an automatic PASS/CHECK verdict.
+  This section runs only if the EEGLAB export is present; otherwise it prints a
+  hint and is skipped. The per-axis cells (2.1/2.3) are placeholders ready to
+  receive the same export.
+
+--------------------------------------------------------------------------------
+PHASE 3 - Machine learning: ICA-component classification
+--------------------------------------------------------------------------------
+  - Extraction of 12 features per component (spectral, temporal, spatial).
+  - Labeling from ICLabel.
+  - Generation of synthetic components to augment the dataset.
+  - Training and comparison of 4 model families (logistic regression, random forest,
+    SVM, gradient boosting) with cross-validation and GridSearchCV.
+  - Comparison to the reference model ICLabel via Cohen's kappa.
+
+--------------------------------------------------------------------------------
+PHASE 4 - Downstream analysis
+--------------------------------------------------------------------------------
+Computation of the power per frequency band over time (band power) on the cleaned
+signal. This proves that the pipeline output is directly usable scientifically, and
+serves as a final quality check.
+
+
+================================================================================
+6. BONUS - MACHINE-LEARNING METHOD COMPARISON (Phase 1bis)
+================================================================================
+
+Beyond reproducing AAS and OBS, the notebook asks a research question: would a model
+richer than the classical template help? For both the gradient and the BCG, the
+current method is compared to three alternatives in the same "template regression"
+family but with an increasingly expressive basis, using two metrics: template-
+residual reduction (higher is better) and alpha-power preservation (close to 1 means
+the neural signal is kept, not destroyed).
+
+--------------------------------------------------------------------------------
+6.1  Gradient (section 1.3bis): AAS vs PCA / Ridge / MLP
+--------------------------------------------------------------------------------
+Methods compared:
+  - AAS (current): single sliding-average template.
+  - PCA regression: optimal basis of principal components (same idea as OBS).
+  - Ridge regression: enlarged basis + regularized regression.
+  - MLP autoencoder: non-linear bottleneck (neural network) instead of a linear
+    projection.
+
+Result: the four methods are practically identical (RMS reduction 95.8-96.5 %,
+template-residual reduction 99.9-100 %). This is an informative negative result: the
+gradient artifact is about 1000 times larger than the EEG, so even the simplest
+template already saturates the achievable performance, leaving no room for a richer
+model to help.
+Note: the alpha-preservation metric is not interpretable for the gradient, because
+the "before" reference is contaminated by spectral leakage of the huge artifact.
+Conclusion: keep the simple AAS - as good as the costlier alternatives, and the
+fastest.
+
+--------------------------------------------------------------------------------
+6.2  BCG (section 1.6bis): OBS vs OBS-auto / Ridge-on-ECG / MLP
+--------------------------------------------------------------------------------
+Methods compared:
+  - OBS (current): 4 fixed principal components per channel.
+  - OBS-auto: number of components chosen automatically per channel by explained
+    variance (data-driven rank).
+  - Ridge on ECG reference: regression of each EEG channel on the ECG and its
+    derivative (external, causal reference; close to adaptive noise cancellation).
+  - MLP autoencoder: non-linear bottleneck on the same internal basis as the OBS.
+
+Result (this is the key bonus finding):
+  - OBS-auto (mean 8 components vs 4) barely gains in RMS but does worse on the two
+    metrics that matter (template reduction 42.3 % vs 44.3 %, alpha preservation
+    0.845 vs 0.926): classic overfitting.
+  - Ridge on ECG reference removes almost nothing (RMS reduction 0.118 %): a linear
+    combination of the ECG is too poor a template.
+  - MLP autoencoder nearly DOUBLES the residual removal (RMS reduction 50.1 % vs
+    21.2 %; template reduction 78.7 % vs 44.3 %) while preserving alpha almost as
+    well (0.907 vs 0.926). This reveals a real non-linear structure in the beat-to-
+    beat variability of the BCG that the linear OBS misses.
+
+Conclusion: unlike the gradient, non-linearity makes a measurable, coherent
+difference for the BCG - the MLP autoencoder clearly outperforms the current OBS.
+Caveat: this is a single-subject result; it must be confirmed on sub-37/sub-41
+before replacing the OBS in the main chain.
+
+
+================================================================================
+7. KEY RESULT OF PHASE 3 - AN OVERFITTING UNMASKED
+================================================================================
+
+A first version mixed real and synthetic components during training then re-evaluated
+on the real components. It gave very high scores (AUC close to 0.999, kappa of 0.71).
+These scores were MISLEADING for two reasons:
+  - data leakage: the real test components had been seen during training;
+  - trivial test set: dominated by very easily separable synthetic components.
+
+The protocol was corrected: training on synthetic data only, testing on the 30 real
+components never seen (out-of-sample). Honest results:
+  - training AUC, cross-validation AUC and synthetic test AUC = 1.00;
+  - but real out-of-sample AUC = only 0.50 to 0.67 (close to chance);
+  - agreement with ICLabel = accuracy 0.53, kappa 0.067 (negligible).
+
+Interpretation: the idealized synthetic components do not capture the real
+variability. The model had overfit the artificial structure of the synthetic data;
+it does not transfer to the real data. This is a NEGATIVE but INFORMATIVE result: a
+credible classifier requires real annotated components, in sufficient number and
+across several subjects.
+
+
+================================================================================
+8. ASSUMED LIMITATIONS
+================================================================================
+
+  - Gradient: simplified in-house AAS (not the full FASTR regularization).
+  - BCG: simplified in-house OBS (no baseline-drift correction).
+  - Non-deterministic ICA: structural comparison, not point by point.
+  - Small N: a single subject; machine learning and the bonus method comparison are
+    not robust at this scale (results to confirm multi-subject).
+  - Synthetic-to-real transfer does not work for the ICA classifier; real
+    multi-subject annotations are needed.
+  - Spectral comparisons: align windowing and units before any conclusion.
+
+
+================================================================================
+9. CONCLUSION AND PERSPECTIVES
+================================================================================
+
+What has been achieved:
+  - A complete, reproducible and open EEG-fMRI pipeline, faithfully reproduced in
+    Python, with the FASTR and OBS algorithms coded from scratch.
+  - A QUANTIFIED EEGLAB vs Python equivalence (2.5), run on a real EEGLAB export:
+    per-stage PSD correlation up to 0.96, alpha peak match (7.7 vs 7.1 Hz, PASS),
+    ICA topography median |r| = 0.61, ICLabel agreement kappa = 0.58 (PASS).
+  - A rigorous machine-learning component, with a sound evaluation protocol that
+    unmasks over-optimism.
+  - A bonus method comparison showing where machine learning helps (BCG) and where it
+    does not (gradient).
+
+Perspectives (genuinely open items):
+  - Manually annotate the real components (a true expert ground truth, more credible
+    than the ICLabel silver standard). This is NOT done yet.
+  - Extend the quantified EEGLAB comparison (2.5) to run-02 and to more subjects.
+  - Aggregate several subjects for robust machine learning, valid statistical tests,
+    and to confirm the MLP-vs-OBS bonus result.
+  - Make the synthetic-data generator more realistic.
+
+
+================================================================================
+10. PROJECT DELIVERABLES
+================================================================================
+
+  - Pipeline_EEG_fMRI_Python.ipynb: main notebook (French), executed end to end,
+    with a Protocol box and an Analysis box for each step.
+  - Pipeline_EEG_fMRI_English.ipynb: English version of the notebook.
+    (Both notebooks now hold the same, most complete content.)
+  - PIPELINE_EXPLICATION_FR.txt and PIPELINE_EXPLANATION_EN.txt: detailed explanation
+    of each step and its protocol.
+  - PRESENTATION_PROJET_FR.txt and PROJECT_PRESENTATION_EN.txt: this overview document
+    (French and English).
+  - The slide presentation: HTML deck, PowerPoint files (FR and EN), and a
+    LaTeX/Beamer deck (English, MIMLAB + Bogazici branding) with real notebook-result
+    screenshots, including the bonus method-comparison figures.
+  - requirements.txt: pinned dependencies for reproducibility.
+
+Technical stack: Python, MNE, mne-icalabel, scikit-learn, scipy, statsmodels,
+pandas, matplotlib. Fixed random seeds, logged intermediate states, naming
+conventions aligned with EEGLAB.
+
+End of document.

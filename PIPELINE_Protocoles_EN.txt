@@ -1,0 +1,521 @@
+================================================================================
+EEG-fMRI PIPELINE IN PYTHON - DETAILED EXPLANATION OF EACH STEP
+================================================================================
+
+Author: Aymen Khatrani - R&D internship, MIMLAB / Prof. Pinar S. Ozbay,
+Bogazici University.
+
+Purpose of this document: explain, step by step, what the pipeline does, WHY we
+do it, the precise PROTOCOL (parameters, method, EEGLAB equivalent) and the
+VALIDITY of each choice. This file accompanies the notebook
+Pipeline_EEG_fMRI_English.ipynb (the French notebook is identical).
+
+Note: this file is deliberately plain text, with no accents or special characters,
+so it stays readable in any editor.
+
+Scientific context: we reproduce in Python (MNE library) an EEG-fMRI preprocessing
+pipeline originally built in EEGLAB (MATLAB, FMRIB plugin). We add a machine-learning
+component (ICA-component classification) and a quantitative EEGLAB vs Python
+comparison.
+
+Data: subject sub-38, 32-channel EEG (31 EEG in the 10-20 system + 1 ECG channel),
+recorded at 5000 Hz inside the MRI scanner, resting-state task, 2 recordings
+(run-01 and run-02), about 392 seconds per run.
+
+
+================================================================================
+PIPELINE OVERVIEW
+================================================================================
+
+BrainVision import
+   -> 1.2 fMRI volume trigger detection
+   -> 1.3 Gradient-artifact correction (AAS, in-house)
+   -> 1.4 50 Hz notch filter
+   -> 1.5 QRS detection on the ECG
+   -> 1.6 Pulse / BCG artifact correction (OBS, in-house)
+   -> 1.7 Resampling to 250 Hz
+   -> 1.8 Common average reference
+   -> 1.9 Band-pass filter 1-40 Hz
+   -> 1.10 ICA (extended Infomax)
+   -> 1.11 Component classification (ICLabel)
+   -> 1.12 Artifact-component removal and reconstruction
+   -> 1.13 Batch processing of the other runs
+
+Then:
+   Phase 2: EEGLAB vs Python comparison (spectral, ICA, statistics)
+   Phase 3: machine learning (ICA-component classification)
+   Phase 4: downstream analysis (time-frequency band power)
+
+
+================================================================================
+PHASE 0 - CONFIGURATION AND DATA LOADING
+================================================================================
+
+--------------------------------------------------------------------------------
+0.1 / 0.2  Dependencies and parameters
+--------------------------------------------------------------------------------
+Protocol:
+  - Libraries: MNE (EEG processing), mne-icalabel (ICLabel), scikit-learn (machine
+    learning), scipy, numpy, pandas, matplotlib, statsmodels.
+  - All parameters are centralized in a single configuration cell: data paths, ECG
+    channel, AAS averaging window (30), number of OBS principal components (4), notch
+    frequency (50 Hz), band-pass bounds (1-40 Hz), resampling frequency (250 Hz), ICA
+    method (extended Infomax), EEG band definitions.
+  - Fixed random seed (seed = 42) for reproducibility.
+
+Details and validity:
+  - Centralizing parameters lets you change everything in one place and avoids
+    hard-coded values scattered through the code.
+  - mne-icalabel needs PyTorch. If it is absent, the notebook falls back to a backup
+    heuristic (HAS_ICLABEL flag).
+
+--------------------------------------------------------------------------------
+0.3  Data loading (real or simulated)
+--------------------------------------------------------------------------------
+Protocol:
+  - If RAW_PATH is set, load the BrainVision file (.vhdr) with read_raw_brainvision.
+    The ECG channel is marked as type "ecg" (not "eeg").
+  - A standard 10-20 montage is applied to provide electrode positions.
+  - If RAW_PATH is None, a function generates a realistic simulated dataset: 1/f-noise
+    EEG plus alpha bursts, an ECG channel with periodic QRS, and a periodically
+    injected gradient artifact.
+
+Details and validity:
+  - Marking the ECG as "ecg" is essential: otherwise MNE would treat it as an EEG
+    channel, which would pollute the average reference and the ICA.
+  - The simulated mode makes the notebook runnable without data, useful for demo and
+    testing.
+
+
+================================================================================
+PHASE 1 - PREPROCESSING
+================================================================================
+
+General note: after each step, the signal state is saved in a log (dictionary
+pipeline_states), mirroring EEGLAB's successive .set files. This allows going back
+and comparing states.
+
+--------------------------------------------------------------------------------
+1.1  Dataset inspection
+--------------------------------------------------------------------------------
+Protocol:
+  - Print the number of channels, the sampling rate, the number of time points, the
+    duration, and the event types (annotations) present.
+
+Details and validity:
+  - Equivalent of EEGLAB's "Dataset info" screen. This is a sanity check before any
+    processing: we verify the data is indeed 32 channels at 5000 Hz.
+
+--------------------------------------------------------------------------------
+1.2  fMRI volume trigger detection (data-driven approach)
+--------------------------------------------------------------------------------
+Protocol:
+  1. List all marker types present in the annotations.
+  2. For each recurrent type, compute: the number of occurrences, the median period
+     between occurrences, and the coefficient of variation (CV = standard deviation
+     divided by the mean of the intervals).
+  3. Discard non-periodic markers (CV greater than or equal to 0.5) or rare ones
+     (fewer than 10 occurrences).
+  4. Among the remaining periodic markers, keep the one with the LONGEST period: it is
+     the fMRI volume trigger. It is assigned to GA_EVENT.
+
+Details and validity:
+  - Why not read the provided Data Note.docx? Because a generic pipeline must recover
+    the correct marker from the signal alone; the Brain Products naming convention is
+    not standardized across labs.
+  - Hardware basis: the SyncBox locks the EEG amplifier clock onto the scanner clock
+    by emitting a very fast, very regular pulse (here period 2.00 s, CV about 4.8 per
+    cent). The scanner also emits, at each TR (volume trigger), a dedicated pulse
+    (here marker R128, period 3.00 s, CV = 0.000). Since the SyncBox is always the
+    faster one, the marker with the longest period is the volume trigger. This is the
+    marker used as an anchor by Allen et al. (2000) and Niazy et al. (2005).
+  - Obtained result: R128 detected, TR about 3.00 s, 120 volumes.
+  - Limitation: assumes at least two distinct periodic markers; otherwise it falls
+    back to the configuration value.
+
+--------------------------------------------------------------------------------
+1.3  Gradient-artifact correction - AAS (Average Artifact Subtraction)
+--------------------------------------------------------------------------------
+Protocol:
+  - For each EEG channel:
+    a. Stack the signal segments aligned on the R128 markers. A segment length is the
+       median interval between two markers.
+    b. Build an artifact template = sliding mean of the 30 neighboring occurrences
+       (parameter AAS_WINDOW).
+    c. Subtract this template segment by segment.
+  - A before / after figure is plotted on one channel, around the first trigger.
+
+Details and validity:
+  - Principle (Allen et al. 2000): the gradient artifact is repetitive and
+    synchronized with the volume trigger. By averaging, the random EEG cancels out and
+    only the artifact template remains.
+  - This is the in-house equivalent of FASTR / FMRIB, coded explicitly (internship
+    goal: a "from scratch" implementation).
+  - Artifact characterization (answers to the Assignment Part 1 questions): in the raw
+    signal it appears as rhythmic bursts of very high amplitude (order of millivolts,
+    i.e. about 1000 times the physiological EEG in microvolts), phase-locked to R128,
+    present only during acquisition. After AAS, the amplitude drops back to the
+    microvolt range.
+  - Strong assumption: stationarity of the artifact over the averaging window. With
+    head motion or clock drift, periodic residuals may remain (handled next by the
+    notch, the band-pass and the ICA).
+  - Assumed simplifications versus FASTR: no upsampling or sub-sample interpolation, no
+    adaptive noise cancellation (ANC). Acceptable for a stable TR and a low-motion
+    subject.
+
+--------------------------------------------------------------------------------
+1.4  50 Hz notch filter
+--------------------------------------------------------------------------------
+Protocol:
+  - Notch filter at 50 Hz applied to the EEG channels (notch_filter).
+
+Details and validity:
+  - 50 Hz is the mains power frequency in Europe and Turkey. The notch removes this
+    interference line. Equivalent of EEGLAB's FIR notch filter.
+
+--------------------------------------------------------------------------------
+1.5  QRS complex detection on the ECG
+--------------------------------------------------------------------------------
+Protocol:
+  - find_ecg_events locates the R-peaks (QRS complexes) on the ECG channel.
+  - The number of detected beats is displayed.
+
+Details and validity:
+  - Equivalent of "FMRIB Detect QRS events". The pulse artifact (BCG) is a mechanical
+    consequence of the heartbeat: the ECG provides the precise timing (R-peak) at
+    which to model the artifact.
+  - Obtained result: 767 beats over 392.5 s, i.e. about 117 beats per minute. This is
+    high for a resting state: plausible in the MRI environment, but should be
+    cross-checked against the scanner's .puls physiological trace since false
+    detections due to artifact residuals are possible.
+
+--------------------------------------------------------------------------------
+1.6  Pulse / BCG artifact correction - OBS (Optimal Basis Set)
+--------------------------------------------------------------------------------
+Protocol:
+  - For each EEG channel:
+    a. Align on each R-peak a segment from -100 ms to +median R-R interval (about one
+       cardiac cycle).
+    b. Compute the mean artifact, then perform a singular value decomposition (SVD) of
+       the matrix of centered segments to obtain the optimal temporal basis.
+    c. Optimal basis = mean artifact + the first 4 principal components (parameter
+       OBS_NCOMP).
+    d. Each beat is approximated by projection onto this basis, then the result is
+       subtracted.
+  - Before / after figure on one channel.
+
+Details and validity:
+  - Principle (Niazy et al. 2005): unlike the gradient (very stable), the BCG shape
+    varies from beat to beat. A fixed template would be insufficient; the PCA basis
+    captures this inter-beat variability.
+  - Equivalent of pop_fmrib_pas in 'obs' mode with 4 principal components. Reimplemented
+    from scratch, MNE having no native OBS.
+  - The choice of 4 components follows Niazy et al.: 3 to 5 generally suffice.
+  - Simplifications: no adaptive windowing of the cardiac cycle nor baseline-drift
+    correction.
+
+--------------------------------------------------------------------------------
+1.7  Resampling to 250 Hz
+--------------------------------------------------------------------------------
+Protocol:
+  - resample to 250 Hz (anti-aliasing FIR filter built into MNE).
+
+Details and validity:
+  - 250 Hz is greater than twice the band-pass upper bound (40 Hz), so the Nyquist
+    criterion is amply satisfied: no useful information is lost.
+  - Correct ordering: resampling AFTER the AAS and the OBS (which need the full 5000 Hz
+    resolution to align templates precisely) and BEFORE the ICA (to reduce compute
+    cost). Consistent with the EEGLAB sequence.
+
+--------------------------------------------------------------------------------
+1.8  Common average reference
+--------------------------------------------------------------------------------
+Protocol:
+  - Average reference computed on the EEG channels only (the ECG is excluded).
+
+Details and validity:
+  - Standard prerequisite for ICA and for ICLabel.
+  - Excluding the ECG is essential: including it would bias the reference and re-inject
+    cardiac activity into all channels.
+  - Expected consequence: loss of one rank, hence 30 ICA components instead of 31.
+
+--------------------------------------------------------------------------------
+1.9  Band-pass filter 1-40 Hz
+--------------------------------------------------------------------------------
+Protocol:
+  - FIR band-pass filter 1-40 Hz on the EEG channels.
+
+Details and validity:
+  - The 1 Hz high-pass removes slow drifts and stabilizes the ICA (MNE and ICLabel
+    recommendation). The 40 Hz low-pass attenuates high-frequency EMG and gradient
+    residuals.
+  - For the Phase 2 comparison, the filter type and order must be aligned with EEGLAB,
+    because a mere transition-band difference creates spectral discrepancies.
+
+--------------------------------------------------------------------------------
+1.10  ICA - extended Infomax
+--------------------------------------------------------------------------------
+Protocol:
+  - Fit an ICA (Infomax method, extended = True option) on the EEG channels only, with
+    a number of components equal to the effective data rank and a fixed random seed.
+
+Details and validity:
+  - Extended Infomax reproduces EEGLAB's runica algorithm and handles both sub-Gaussian
+    and super-Gaussian sources (suited to the mixture of neural sources and artifacts).
+  - Effective rank of 30 (because of the average reference): correct.
+  - ICA is not deterministic: the seed is fixed for reproducibility, but the order,
+    sign and scale of the components will differ from EEGLAB. This is why the Phase 2.3
+    comparison is structural, not point by point.
+
+--------------------------------------------------------------------------------
+1.11  Automatic component classification - ICLabel
+--------------------------------------------------------------------------------
+Protocol:
+  - label_components (iclabel method) assigns each component one of 7 classes (brain,
+    eye blink, muscle artifact, heart, line noise, channel noise, other) and a
+    probability.
+  - Any class other than brain or other is flagged as artifact.
+
+Details and validity:
+  - Pre-trained domain baseline (Pion-Tonachini et al. 2019). Serves as the reference
+    against which the in-house classifier (Phase 3) is compared.
+  - ICLabel is calibrated for a 1-100 Hz signal, average reference and a set montage.
+    Here we are at 1-40 Hz: a minor band discrepancy to note.
+  - It is a silver standard, not absolute ground truth.
+  - Keeping the (ambiguous) "other" class is a conservative choice that minimizes loss
+    of neural signal.
+  - Obtained result: 5 of the 30 components flagged as artifact (eye blinks, muscle,
+    etc.).
+
+--------------------------------------------------------------------------------
+1.12  Component removal and reconstruction
+--------------------------------------------------------------------------------
+Protocol:
+  - Mark the artifact components in ica.exclude, then apply ica.apply to reconstruct
+    the signal without those components.
+  - Save the cleaned signal in .fif format (equivalent of the EEGLAB .set).
+
+Details and validity:
+  - A 5/30 rejection rate (about 17 per cent): typical for properly preprocessed
+    EEG-fMRI.
+
+--------------------------------------------------------------------------------
+1.13  Batch processing of the other runs
+--------------------------------------------------------------------------------
+Protocol:
+  - A preprocess_run function replays EXACTLY the same steps (1.2 to 1.12) on any
+    .vhdr file, and saves one cleaned .fif per run.
+  - Trigger detection is redone for each run.
+
+Details and validity:
+  - Guarantees that run-02 is processed identically to run-01, with no copy-paste.
+
+
+================================================================================
+PHASE 2 - EEGLAB VS PYTHON COMPARISON
+================================================================================
+
+Goal: verify that the Python pipeline reproduces EEGLAB and QUANTIFY the discrepancies
+instead of assuming them to be zero. To plug in EEGLAB, export from MATLAB the
+quantities to compare into an eeglab_exports folder (.csv or .npy files). As long as
+they are absent, the cells plot the Python side alone.
+
+--------------------------------------------------------------------------------
+2.1  Spectral axis - PSD (Welch)
+--------------------------------------------------------------------------------
+Protocol:
+  - Power spectral density via Welch's method (compute_psd, 0.1-35 Hz), converted to
+    decibels (10 times log10).
+  - If an EEGLAB spectopo export is present, compute the correlation and the mean
+    absolute error (MAE) between the two.
+
+Details and validity:
+  - The cleaned signal follows the expected 1/f decay of a physiological EEG: the
+    pipeline preserves the spectral information instead of distorting it.
+  - Pitfall: the Welch parameters (window size, overlap, apodization window) and above
+    all the units (dB vs microV2/Hz) must be aligned before any discrepancy
+    conclusion.
+
+--------------------------------------------------------------------------------
+2.2  Spectral axis - Morlet wavelet time-frequency
+--------------------------------------------------------------------------------
+Protocol:
+  - Segmentation into 2 s sliding epochs, then Morlet wavelet time-frequency transform
+    (tfr_array_morlet, 2-40 Hz, number of cycles = frequency / 2).
+  - Power averaged over epochs and channels.
+
+Details and validity:
+  - The lab uses Morlet wavelets (equivalent of EEGLAB's newtimef).
+  - The parameter number of cycles = frequency / 2 favors temporal resolution.
+  - For a fair comparison, align the number of cycles, the frequency grid and the
+    normalization baseline.
+
+--------------------------------------------------------------------------------
+2.3  ICA axis - structural comparison
+--------------------------------------------------------------------------------
+Protocol:
+  - Match two sets of topographies (Python vs EEGLAB) by maximum absolute spatial
+    correlation; report the mean and median correlation of the pairs.
+
+Details and validity:
+  - The only valid comparison because ICA is invariant to component permutation, sign
+    and scale; the absolute value neutralizes the sign.
+  - Greedy matching (argmax) is acceptable; optimal matching (Hungarian algorithm)
+    would be more rigorous with many components.
+
+--------------------------------------------------------------------------------
+2.4  Inferential statistics axis
+--------------------------------------------------------------------------------
+Protocol:
+  - Paired Wilcoxon signed-rank test, Cohen's d_z effect size, sign-flip permutation
+    test, multiple-comparison corrections (Bonferroni and Benjamini-Hochberg FDR).
+  - Applied here to two SIMULATED conditions.
+
+Details and validity:
+  - WARNING: the displayed values come from simulated data and are NOT results on
+    sub-38. This section only demonstrates the inference chain used by the lab.
+  - These non-parametric tests are suited to small samples (N of 3 to 14). On real
+    data, they would apply to band powers aggregated over several subjects.
+
+
+================================================================================
+PHASE 3 - MACHINE LEARNING: ICA-COMPONENT CLASSIFICATION
+================================================================================
+
+Idea: do not merely use ICLabel (a pre-trained model), but build your own dataset and
+train your own models, compared to ICLabel.
+
+--------------------------------------------------------------------------------
+3.1  Per-component feature extraction
+--------------------------------------------------------------------------------
+Protocol:
+  - 12 descriptors per component, in three families:
+    a. Spectral: relative band power (delta, theta, alpha, beta, gamma), peak
+       frequency, 1/f slope.
+    b. Temporal: kurtosis, skewness, median of the absolute value.
+    c. Spatial: topography entropy, topography maximum.
+
+Details and validity:
+  - Three complementary families aligned with ICLabel's discriminative axes (spectrum,
+    temporal shape, spatial focality).
+  - Band powers are normalized by total power (scale invariance).
+  - Observed example: component 2 (artifact) combines a peak at 40.5 Hz, an extreme
+    kurtosis (241) and high gamma power: a typical artifact signature.
+
+--------------------------------------------------------------------------------
+3.2  Labeling
+--------------------------------------------------------------------------------
+Protocol:
+  - Binary labels (0 = neural, 1 = artifact) = binarized ICLabel if available,
+    otherwise a fallback heuristic (high kurtosis or focal topography).
+
+Details and validity:
+  - Taking ICLabel as ground truth gives cheap labels but CAPS the performance: the
+    model can at best imitate ICLabel, including its errors.
+  - Expert manual annotations would be more credible (to validate with the supervisor).
+
+--------------------------------------------------------------------------------
+3.3  Synthetic data
+--------------------------------------------------------------------------------
+Protocol:
+  - Generate 300 synthetic components (neural vs artifact) by drawing each feature from
+    a class-specific Gaussian.
+  - These synthetic data are RESERVED for training; the 30 real components are RESERVED
+    for testing (never seen during training).
+
+Details and validity:
+  - CRITICAL POINT: the generative model already encodes the decision boundary
+    (disjoint Gaussians), so the synthetic task is trivially separable and the
+    near-perfect synthetic scores are NOT informative.
+  - These data only serve to (a) run the ML chain despite the small real N and (b)
+    measure transfer to the real data. It is in no way a real validation.
+
+--------------------------------------------------------------------------------
+3.4  Model selection and hyperparameter optimization
+--------------------------------------------------------------------------------
+Protocol (leakage-free protocol):
+  - Training and cross-validation EXCLUSIVELY on the synthetic data.
+  - GridSearchCV with 5 folds (AUC score) over 4 model families: logistic regression,
+    random forest, SVM, gradient boosting.
+  - Best-model selection by the synthetic cross-validation AUC, which NEVER uses the
+    real labels.
+  - The 30 real components serve as the out-of-sample test.
+  - For each model we report: training AUC, cross-validation AUC, synthetic test AUC,
+    real out-of-sample AUC, real F1.
+
+Details and validity (overfitting diagnosis):
+  - Obtained results: train = cross-validation = synthetic test = 1.00 for the 4
+    models. This means there is NO internal overfitting, but the synthetic task is
+    trivial.
+  - However, the real out-of-sample AUC collapses to between 0.50 and 0.67 (logistic
+    regression 0.67, SVM 0.62, forest 0.52, boosting 0.50, close to chance).
+  - This huge gap between synthetic (1.00) and real (about 0.6) is the signature of a
+    DISTRIBUTION SHIFT: the synthetic components do not capture the real variability.
+    The model overfit the artificial structure of the synthetic data.
+  - This is an informative negative result (not a bug): synthetic augmentation alone is
+    not enough; real annotated multi-subject components are needed.
+
+--------------------------------------------------------------------------------
+3.5  Comparison to ICLabel (benchmark)
+--------------------------------------------------------------------------------
+Protocol:
+  - Apply the selected model to the 30 real components (out-of-sample test) and measure
+    agreement with ICLabel via accuracy and Cohen's kappa.
+
+Details and validity:
+  - Unbiased evaluation: the model saw only synthetic data, so no leakage.
+  - Obtained result: accuracy = 0.53, kappa = 0.067 (negligible agreement on the
+    Landis and Koch scale).
+  - This result flatly contradicts the kappa = 0.71 obtained in an earlier version with
+    data leakage (real components partly seen during training): the latter was a
+    methodological artifact.
+  - Kappa is chosen because it is robust to class imbalance (5 artifacts out of 30);
+    raw accuracy would be inflated by the majority of "brain" components.
+  - Takeaway: validating an ICA-component classifier requires real annotated
+    components, in sufficient number and multi-subject.
+
+
+================================================================================
+PHASE 4 - DOWNSTREAM ANALYSIS: TIME-FREQUENCY BAND POWER
+================================================================================
+
+Protocol:
+  - Spectrogram (STFT, 2 s window, 1.5 s overlap) of the channel-averaged cleaned EEG,
+    then power integrated per band over time.
+  - Also plots the final PSD (Assignment Part 3, question 1).
+
+Details and validity:
+  - Reproduces the MATLAB spectrogram of Assignment Part 3 and serves as a final
+    quality check: for a resting-state recording, one expects relatively stationary
+    band powers. Marked transient spikes would betray an artifact residual not captured
+    by the ICA.
+  - Averaging all channels masks spatial specificity: acceptable for an overview, to be
+    refined per channel or region if needed.
+
+
+================================================================================
+ASSUMED LIMITATIONS (TO WRITE IN THE REPORT)
+================================================================================
+
+  - Gradient: simplified in-house AAS (not the full FASTR regularization:
+    interpolation, upsampling, optional ANC).
+  - BCG: in-house OBS (mean + first 4 principal components); a simplified variant of
+    the FMRIB OBS (no baseline-drift correction nor adaptive cardiac-cycle windowing).
+  - Non-deterministic ICA: structural comparison, not point by point.
+  - Small N: on a single subject, ML is not robust.
+  - Synthetic to real transfer (key result): AUC 1.00 on synthetic but only 0.50 to
+    0.67 on real out-of-sample, and kappa = 0.067 against ICLabel. Synthetic
+    augmentation alone does not transfer. Never report synthetic scores as real
+    performance.
+  - Spectral comparisons: align windowing and units before any conclusion.
+
+
+================================================================================
+REPRODUCIBILITY
+================================================================================
+
+Stack: Python, MNE, mne-icalabel, scikit-learn, scipy, statsmodels, pandas,
+matplotlib. Fixed random seeds, logged intermediate states, naming conventions
+aligned with EEGLAB. Dependencies pinned in requirements.txt.
+
+End of document.
