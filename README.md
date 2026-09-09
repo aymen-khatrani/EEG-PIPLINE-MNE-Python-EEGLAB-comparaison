@@ -10,6 +10,7 @@ against ICLabel.
 - `Pipeline_EEG_fMRI_English.ipynb` — main notebook: preprocessing pipeline, EEGLAB↔Python comparison,
   ICA-component classifier, band-power analysis.
 - `PIPELINE_Protocoles_EN.txt` — written protocol description.
+- `Presentation_EEG_fMRI_EN.pdf` — project presentation slides.
 - `requirements.txt` — pinned Python dependencies.
 
 ## Setup
